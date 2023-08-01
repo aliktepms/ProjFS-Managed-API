@@ -187,7 +187,8 @@ namespace SimpleProviderManaged
                 if (reparsePointTag != (uint)DwReserved0Flag.IO_REPARSE_TAG_SYMLINK
                     && reparsePointTag != (uint)DwReserved0Flag.IO_REPARSE_TAG_MOUNT_POINT)
                 {
-                    throw new NotSupportedException($"Reparse point tag {reparsePointTag:X} not supported");
+                    // throw new NotSupportedException($"Reparse point tag {reparsePointTag:X} not supported");
+                    return targetPath;
                 }
 
                 uint pathBufferOffsetIndex = (uint)((reparsePointTag == (uint)DwReserved0Flag.IO_REPARSE_TAG_SYMLINK) ? 20 : 16);

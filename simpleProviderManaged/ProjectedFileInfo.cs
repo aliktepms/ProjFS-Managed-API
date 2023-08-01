@@ -29,6 +29,8 @@ namespace SimpleProviderManaged
             this.ChangeTime = changeTime;
             // Make sure the directory attribute is stored properly.
             this.Attributes = isDirectory ? (attributes | FileAttributes.Directory) : (attributes & ~FileAttributes.Directory);
+
+            this.Attributes &= ~FileAttributes.ReparsePoint;
         }
 
         public ProjectedFileInfo(
@@ -55,7 +57,7 @@ namespace SimpleProviderManaged
         public DateTime LastAccessTime { get; }
         public DateTime LastWriteTime { get; }
         public DateTime ChangeTime { get; }
-        public FileAttributes Attributes { get; }
+        public FileAttributes Attributes { get; private set; }
     }
 }
 
