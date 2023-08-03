@@ -41,6 +41,8 @@ namespace SimpleProviderManaged
 
             this.Options = options;
 
+            this.getLayerFileSystemInfoFuzzyCache = new(this.GetLayerFileSystemInfoFuzzy);
+
             // If in test mode, enable notification callbacks.
             if (this.Options.TestMode)
             {
@@ -187,18 +189,42 @@ namespace SimpleProviderManaged
         protected bool FileExistsInLayer(string relativePath)
             => this.FileInfoCache.Get(this.GetFullPathInLayer(relativePath)).Exists;
 
-        protected ProjectedFileInfo GetFileInfoInLayer(string relativePath)
+        protected ProjectedFileInfo GetProjectedFileInfoInLayer(string relativePath)
+            => this.GetProjectedFileInfo(this.getLayerFileSystemInfoFuzzyCache.Get(relativePath));
+
+        private SimpleCache<string, FileSystemInfo> getLayerFileSystemInfoFuzzyCache;
+
+        private FileSystemInfo GetLayerFileSystemInfoFuzzy(string relativePath)
         {
-            string layerPath = this.GetFullPathInLayer(relativePath);
-            string layerParentPath = Path.GetDirectoryName(layerPath);
-            string layerName = Path.GetFileName(relativePath);
+            // Check whether the parent directory exists in the layer.
+            string fullPath = this.GetFullPathInLayer(relativePath);
+            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(Path.GetDirectoryName(fullPath));
 
-            if (this.FileOrDirectoryExistsInLayer(layerParentPath, layerName, out ProjectedFileInfo fileInfo))
-            {
-                return fileInfo;
-            }
+            // Get the FileSystemInfo for the entry in the layer that matches the name, using ProjFS's
+            // name matching rules.
+            return
+                dirInfo.Exists
+                ? this.DirectoryContentsCache.Get(dirInfo)
+                    .FirstOrDefault(fsInfo => Utils.IsFileNameMatch(fsInfo.Name, Path.GetFileName(relativePath)))
+                : null;
+        }
 
-            return null;
+        private ProjectedFileInfo GetProjectedFileInfo(FileSystemInfo fileSystemInfo)
+        {
+            if(fileSystemInfo == null) { return null; }
+
+            bool isDirectory = ((fileSystemInfo.Attributes & FileAttributes.Directory) == FileAttributes.Directory);
+
+            return new ProjectedFileInfo(
+                name: fileSystemInfo.Name,
+                fullName: fileSystemInfo.FullName,
+                size: isDirectory ? 0 : (fileSystemInfo as FileInfo).Length,
+                isDirectory: isDirectory,
+                creationTime: fileSystemInfo.CreationTime,
+                lastAccessTime: fileSystemInfo.LastAccessTime,
+                lastWriteTime: fileSystemInfo.LastWriteTime,
+                changeTime: fileSystemInfo.LastWriteTime,
+                attributes: fileSystemInfo.Attributes);
         }
 
         protected IEnumerable<ProjectedFileInfo> GetChildItemsInLayer(string relativePath)
@@ -214,33 +240,7 @@ namespace SimpleProviderManaged
             foreach (FileSystemInfo fileSystemInfo in this.DirectoryContentsCache.Get(dirInfo))
             {
                 // We only handle files and directories, not symlinks.
-                if ((fileSystemInfo.Attributes & FileAttributes.Directory) == FileAttributes.Directory)
-                {
-                    yield return new ProjectedFileInfo(
-                        fileSystemInfo.Name,
-                        fileSystemInfo.FullName,
-                        size: 0,
-                        isDirectory: true,
-                        creationTime: fileSystemInfo.CreationTime,
-                        lastAccessTime: fileSystemInfo.LastAccessTime,
-                        lastWriteTime: fileSystemInfo.LastWriteTime,
-                        changeTime: fileSystemInfo.LastWriteTime,
-                        attributes: fileSystemInfo.Attributes);
-                }
-                else
-                {
-                    FileInfo fileInfo = fileSystemInfo as FileInfo;
-                    yield return new ProjectedFileInfo(
-                        fileInfo.Name,
-                        fileSystemInfo.FullName,
-                        size: fileInfo.Length,
-                        isDirectory: false,
-                        creationTime: fileSystemInfo.CreationTime,
-                        lastAccessTime: fileSystemInfo.LastAccessTime,
-                        lastWriteTime: fileSystemInfo.LastWriteTime,
-                        changeTime: fileSystemInfo.LastWriteTime,
-                        attributes: fileSystemInfo.Attributes);
-                }
+                yield return this.GetProjectedFileInfo(fileSystemInfo);
             }
         }
 
@@ -287,44 +287,6 @@ namespace SimpleProviderManaged
                 Array.Sort(arr, (x, y) => Utils.FileNameCompare(x.Name, y.Name));
                 return arr;
             });
-
-        private bool FileOrDirectoryExistsInLayer(string layerParentPath, string layerName, out ProjectedFileInfo fileInfo)
-        {
-            fileInfo = null;
-
-            // Check whether the parent directory exists in the layer.
-            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(layerParentPath);
-            if (!dirInfo.Exists)
-            {
-                return false;
-            }
-
-            // Get the FileSystemInfo for the entry in the layer that matches the name, using ProjFS's
-            // name matching rules.
-            FileSystemInfo fileSystemInfo =
-                this.DirectoryContentsCache.Get(dirInfo)
-                .FirstOrDefault(fsInfo => Utils.IsFileNameMatch(fsInfo.Name, layerName));
-
-            if (fileSystemInfo == null)
-            {
-                return false;
-            }
-
-            bool isDirectory = ((fileSystemInfo.Attributes & FileAttributes.Directory) == FileAttributes.Directory);
-
-            fileInfo = new ProjectedFileInfo(
-                name: fileSystemInfo.Name,
-                fullName: fileSystemInfo.FullName,
-                size: isDirectory ? 0 : (fileSystemInfo as FileInfo).Length,
-                isDirectory: isDirectory,
-                creationTime: fileSystemInfo.CreationTime,
-                lastAccessTime: fileSystemInfo.LastAccessTime,
-                lastWriteTime: fileSystemInfo.LastWriteTime,
-                changeTime: fileSystemInfo.LastWriteTime,
-                attributes: fileSystemInfo.Attributes);
-
-            return true;
-        }
 
         #region Callback implementations
 
@@ -518,10 +480,11 @@ namespace SimpleProviderManaged
                 Log.Verbose("  Placeholder creation triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
 
                 HResult hr = HResult.Ok;
-                ProjectedFileInfo fileInfo = this.GetFileInfoInLayer(relativePath);
+                ProjectedFileInfo fileInfo = this.GetProjectedFileInfoInLayer(relativePath);
                 if (fileInfo == null)
                 {
                     hr = HResult.FileNotFound;
+                    this.UpdateStats("GtPHInfo-FileNotFound", stopWatch);
                 }
                 else
                 {
@@ -532,7 +495,9 @@ namespace SimpleProviderManaged
                     }
                     else
                     {
+                        Stopwatch writeSw = Stopwatch.StartNew();
                         hr = this.WritePlaceholderInfo(relativePath, fileInfo, targetPath);
+                        this.UpdateStats("GtPHInfo-WriteInfo", writeSw);
                     }
                 }
 
@@ -693,25 +658,30 @@ namespace SimpleProviderManaged
 
         private bool TryGetTargetIfReparsePoint(ProjectedFileInfo fileInfo, string fullPath, out string targetPath)
         {
-            targetPath = null;
-
-            if ((fileInfo.Attributes & FileAttributes.ReparsePoint) != 0 /* TODO: Check for reparse point type */)
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
             {
-                if (!FileSystemApi.TryGetReparsePointTarget(fullPath, out targetPath))
-                {
-                    return false;
-                }
-                else if (Path.IsPathRooted(targetPath))
-                {
-                    string targetRelativePath = FileSystemApi.TryGetPathRelativeToRoot(this.layerRoot, targetPath, fileInfo.IsDirectory);
-                    // GetFullPath is used to get rid of relative path components (such as .\)
-                    targetPath = Path.GetFullPath(Path.Combine(this.scratchRoot, targetRelativePath));
+                targetPath = null;
 
-                    return true;
+                if ((fileInfo.Attributes & FileAttributes.ReparsePoint) != 0 /* TODO: Check for reparse point type */)
+                {
+                    if (!FileSystemApi.TryGetReparsePointTarget(fullPath, out targetPath))
+                    {
+                        return false;
+                    }
+                    else if (Path.IsPathRooted(targetPath))
+                    {
+                        string targetRelativePath = FileSystemApi.TryGetPathRelativeToRoot(this.layerRoot, targetPath, fileInfo.IsDirectory);
+                        // GetFullPath is used to get rid of relative path components (such as .\)
+                        targetPath = Path.GetFullPath(Path.Combine(this.scratchRoot, targetRelativePath));
+
+                        return true;
+                    }
                 }
+
+                return true;
             }
-
-            return true;
+            finally { this.UpdateStats(nameof(TryGetTargetIfReparsePoint), stopWatch); }
         }
 
         public void DumpStats()
@@ -724,6 +694,7 @@ namespace SimpleProviderManaged
             Log.Information($"FileInfoCache:{this.FileInfoCache.GetStats()}");
             Log.Information($"DirectoryInfoCache:{this.DirectoryInfoCache.GetStats()}");
             Log.Information($"DirectoryContentsCache:{this.DirectoryContentsCache.GetStats()}");
+            Log.Information($"getLayerFileSystemInfoFuzzyCache:{this.getLayerFileSystemInfoFuzzyCache.GetStats()}");
         }
 
         #endregion
