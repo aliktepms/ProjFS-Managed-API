@@ -342,7 +342,7 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> StartDirectoryEnumerationCallback Path [{Path}]", relativePath);
+                Log.Verbose("----> StartDirectoryEnumerationCallback Path [{Path}]", relativePath);
 
                 // Enumerate the corresponding directory in the layer and ensure it is sorted the way
                 // ProjFS expects.
@@ -358,7 +358,7 @@ namespace SimpleProviderManaged
                     return HResult.InternalError;
                 }
 
-                Log.Information("<---- StartDirectoryEnumerationCallback {Result}", HResult.Ok);
+                Log.Verbose("<---- StartDirectoryEnumerationCallback {Result}", HResult.Ok);
 
                 return HResult.Ok;
             }
@@ -380,7 +380,7 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> GetDirectoryEnumerationCallback filterFileName [{Filter}]", filterFileName);
+                Log.Verbose("----> GetDirectoryEnumerationCallback filterFileName [{Filter}]", filterFileName);
 
                 // Find the requested enumeration.  It should have been put there by StartDirectoryEnumeration.
                 if (!this.activeEnumerations.TryGetValue(enumerationId, out ActiveEnumeration enumeration))
@@ -445,7 +445,7 @@ namespace SimpleProviderManaged
 
                 if (hr == HResult.Ok)
                 {
-                    Log.Information("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
+                    Log.Verbose("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
                 }
                 else
                 {
@@ -491,14 +491,14 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> EndDirectoryEnumerationCallback");
+                Log.Verbose("----> EndDirectoryEnumerationCallback");
 
                 if (!this.activeEnumerations.TryRemove(enumerationId, out ActiveEnumeration enumeration))
                 {
                     return HResult.InternalError;
                 }
 
-                Log.Information("<---- EndDirectoryEnumerationCallback {Result}", HResult.Ok);
+                Log.Verbose("<---- EndDirectoryEnumerationCallback {Result}", HResult.Ok);
 
                 return HResult.Ok;
             }
@@ -514,8 +514,8 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> GetPlaceholderInfoCallback [{Path}]", relativePath);
-                Log.Information("  Placeholder creation triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
+                Log.Verbose("----> GetPlaceholderInfoCallback [{Path}]", relativePath);
+                Log.Verbose("  Placeholder creation triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
 
                 HResult hr = HResult.Ok;
                 ProjectedFileInfo fileInfo = this.GetFileInfoInLayer(relativePath);
@@ -536,7 +536,7 @@ namespace SimpleProviderManaged
                     }
                 }
 
-                Log.Information("<---- GetPlaceholderInfoCallback {Result}", hr);
+                Log.Verbose("<---- GetPlaceholderInfoCallback {Result}", hr);
                 return hr;
             }
             finally { this.UpdateStats(nameof(GetPlaceholderInfoCallback), stopWatch); }
@@ -589,8 +589,8 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> GetFileDataCallback relativePath [{Path}]", relativePath);
-            Log.Information("  triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
+                Log.Verbose("----> GetFileDataCallback relativePath [{Path}]", relativePath);
+            Log.Verbose("  triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
 
             HResult hr = HResult.Ok;
             if (!this.FileExistsInLayer(relativePath))
@@ -659,7 +659,7 @@ namespace SimpleProviderManaged
                 }
             }
 
-            Log.Information("<---- return status {Result}", hr);
+            Log.Verbose("<---- return status {Result}", hr);
             return hr;
             }
             finally { this.UpdateStats(nameof(GetFileDataCallback), stopWatch); }
@@ -671,7 +671,7 @@ namespace SimpleProviderManaged
             Stopwatch stopWatch = Stopwatch.StartNew();
             try
             {
-                Log.Information("----> QueryFileNameCallback relativePath [{Path}]", relativePath);
+                Log.Verbose("----> QueryFileNameCallback relativePath [{Path}]", relativePath);
 
             HResult hr = HResult.Ok;
             string parentDirectory = Path.GetDirectoryName(relativePath);
@@ -685,7 +685,7 @@ namespace SimpleProviderManaged
                 hr = HResult.FileNotFound;
             }
 
-            Log.Information("<---- QueryFileNameCallback {Result}", hr);
+            Log.Verbose("<---- QueryFileNameCallback {Result}", hr);
             return hr;
             }
             finally { this.UpdateStats(nameof(QueryFileNameCallback), stopWatch); }
@@ -732,6 +732,7 @@ namespace SimpleProviderManaged
         {
             private readonly ConcurrentDictionary<KType, VType> cache = new ConcurrentDictionary<KType, VType>();
             private readonly Func<KType, VType> valueFactory;
+            private TimeSpan factoryTime = TimeSpan.Zero;
 
             public long Queries { get; private set; } = 0;
             public long Misses => this.cache.Count;
@@ -742,14 +743,23 @@ namespace SimpleProviderManaged
                 this.valueFactory = valueFactory;
             }
 
+            private VType InstrumentedFactory(KType key)
+            {
+                Stopwatch sw = Stopwatch.StartNew();
+                VType result = this.valueFactory(key);
+                sw.Stop();
+                this.factoryTime += sw.Elapsed;
+                return this.valueFactory(key);
+            }
+
             public VType Get(KType key)
             {
                 this.Queries++;
-                return this.cache.GetOrAdd(key, this.valueFactory);
+                return this.cache.GetOrAdd(key, this.InstrumentedFactory);
             }
 
             public string GetStats() 
-                => $"Queries: {this.Queries}, Hits: {this.Hits}, Misses: {this.Misses}, Ratio:{(decimal)this.Hits/Math.Max(this.Misses,1)}";
+                => $"Queries: {this.Queries}, Misses: {this.Misses}, TimeBuilding:{this.factoryTime}, Hits: {this.Hits}, Ratio:{(decimal)this.Hits/Math.Max(this.Misses,1):0.2}";
         }
 
         private class RequiredCallbacks : IRequiredCallbacks
