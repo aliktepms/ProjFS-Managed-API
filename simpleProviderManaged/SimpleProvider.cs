@@ -19,7 +19,6 @@ namespace SimpleProviderManaged
     /// </summary>
     public class SimpleProvider
     {
-        private bool isVerbose = false;
         private ConcurrentDictionary<string, (int Count, TimeSpan Duration)> stats = new ();
 
         // These variables hold the layer and scratch paths.
