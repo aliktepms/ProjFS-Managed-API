@@ -19,6 +19,7 @@ namespace SimpleProviderManaged
     /// </summary>
     public class SimpleProvider
     {
+        private bool isVerbose = false;
         private ConcurrentDictionary<string, (int Count, TimeSpan Duration)> stats = new ();
 
         // These variables hold the layer and scratch paths.
@@ -177,21 +178,15 @@ namespace SimpleProviderManaged
 
         protected string GetFullPathInLayer(string relativePath) => Path.Combine(this.layerRoot, relativePath);
 
-        protected bool DirectoryExistsInLayer(string relativePath)
-        {
-            string layerPath = this.GetFullPathInLayer(relativePath);
-            DirectoryInfo dirInfo = new DirectoryInfo(layerPath);
+        private SimpleCache<string, DirectoryInfo> DirectoryInfoCache = new((p)=>new DirectoryInfo(p));
 
-            return dirInfo.Exists;
-        }
+        protected bool DirectoryExistsInLayer(string relativePath)
+            => this.DirectoryInfoCache.Get(this.GetFullPathInLayer(relativePath)).Exists;
+
+        private SimpleCache<string,  FileInfo> FileInfoCache = new((p) => new FileInfo(p));
 
         protected bool FileExistsInLayer(string relativePath)
-        {
-            string layerPath = this.GetFullPathInLayer(relativePath);
-            FileInfo fileInfo = new FileInfo(layerPath);
-
-            return fileInfo.Exists;
-        }
+            => this.FileInfoCache.Get(this.GetFullPathInLayer(relativePath)).Exists;
 
         protected ProjectedFileInfo GetFileInfoInLayer(string relativePath)
         {
@@ -209,15 +204,15 @@ namespace SimpleProviderManaged
 
         protected IEnumerable<ProjectedFileInfo> GetChildItemsInLayer(string relativePath)
         {
-            string fullPathInLayer = GetFullPathInLayer(relativePath);
-            DirectoryInfo dirInfo = new DirectoryInfo(fullPathInLayer);
+            string fullPathInLayer = this.GetFullPathInLayer(relativePath);
+            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(fullPathInLayer);
 
             if (!dirInfo.Exists)
             {
                 yield break;
             }
 
-            foreach (FileSystemInfo fileSystemInfo in dirInfo.GetFileSystemInfos())
+            foreach (FileSystemInfo fileSystemInfo in this.DirectoryContentsCache.Get(dirInfo))
             {
                 // We only handle files and directories, not symlinks.
                 if ((fileSystemInfo.Attributes & FileAttributes.Directory) == FileAttributes.Directory)
@@ -253,7 +248,7 @@ namespace SimpleProviderManaged
         protected HResult HydrateFile(string relativePath, uint bufferSize, Func<byte[], uint, bool> tryWriteBytes)
         {
             string layerPath = this.GetFullPathInLayer(relativePath);
-            if (!File.Exists(layerPath))
+            if (!this.FileInfoCache.Get(layerPath).Exists)
             {
                 return HResult.FileNotFound;
             }
@@ -286,12 +281,20 @@ namespace SimpleProviderManaged
             return HResult.Ok;
         }
 
+        private SimpleCache<DirectoryInfo, FileSystemInfo[]> DirectoryContentsCache = 
+            new(d => 
+            { 
+                var arr = d.GetFileSystemInfos(); 
+                Array.Sort(arr, (x, y) => Utils.FileNameCompare(x.Name, y.Name));
+                return arr;
+            });
+
         private bool FileOrDirectoryExistsInLayer(string layerParentPath, string layerName, out ProjectedFileInfo fileInfo)
         {
             fileInfo = null;
 
             // Check whether the parent directory exists in the layer.
-            DirectoryInfo dirInfo = new DirectoryInfo(layerParentPath);
+            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(layerParentPath);
             if (!dirInfo.Exists)
             {
                 return false;
@@ -300,8 +303,7 @@ namespace SimpleProviderManaged
             // Get the FileSystemInfo for the entry in the layer that matches the name, using ProjFS's
             // name matching rules.
             FileSystemInfo fileSystemInfo =
-                dirInfo
-                .GetFileSystemInfos()
+                this.DirectoryContentsCache.Get(dirInfo)
                 .FirstOrDefault(fsInfo => Utils.IsFileNameMatch(fsInfo.Name, layerName));
 
             if (fileSystemInfo == null)
@@ -314,7 +316,7 @@ namespace SimpleProviderManaged
             fileInfo = new ProjectedFileInfo(
                 name: fileSystemInfo.Name,
                 fullName: fileSystemInfo.FullName,
-                size: isDirectory ? 0 : new FileInfo(Path.Combine(layerParentPath, layerName)).Length,
+                size: isDirectory ? 0 : (fileSystemInfo as FileInfo).Length,
                 isDirectory: isDirectory,
                 creationTime: fileSystemInfo.CreationTime,
                 lastAccessTime: fileSystemInfo.LastAccessTime,
@@ -346,8 +348,7 @@ namespace SimpleProviderManaged
                 // Enumerate the corresponding directory in the layer and ensure it is sorted the way
                 // ProjFS expects.
                 ActiveEnumeration activeEnumeration = new ActiveEnumeration(
-                    GetChildItemsInLayer(relativePath)
-                    .OrderBy(file => file.Name, new ProjFSSorter())
+                    this.GetChildItemsInLayer(relativePath)
                     .ToList());
 
                 // Insert the layer enumeration into our dictionary of active enumerations, indexed by
@@ -412,7 +413,7 @@ namespace SimpleProviderManaged
                 {
                     ProjectedFileInfo fileInfo = enumeration.Current;
 
-                    if (!TryGetTargetIfReparsePoint(fileInfo, fileInfo.FullName, out string targetPath))
+                    if (!this.TryGetTargetIfReparsePoint(fileInfo, fileInfo.FullName, out string targetPath))
                     {
                         hr = HResult.InternalError;
                         break;
@@ -423,7 +424,7 @@ namespace SimpleProviderManaged
                     // add. ProjFS will call the GetDirectoryEnumerationCallback again, and the provider
                     // must resume adding entries, starting at the last one it tried to add. SimpleProvider
                     // remembers the entry it couldn't add simply by not advancing its ActiveEnumeration.
-                    if (AddFileInfoToEnum(enumResult, fileInfo, targetPath))
+                    if (this.AddFileInfoToEnum(enumResult, fileInfo, targetPath))
                     {
                         Log.Verbose("----> GetDirectoryEnumerationCallback Added {Entry} {Kind} {Target}", fileInfo.Name, fileInfo.IsDirectory, targetPath);
 
@@ -526,13 +527,13 @@ namespace SimpleProviderManaged
                 else
                 {
                     string layerPath = this.GetFullPathInLayer(relativePath);
-                    if (!TryGetTargetIfReparsePoint(fileInfo, layerPath, out string targetPath))
+                    if (!this.TryGetTargetIfReparsePoint(fileInfo, layerPath, out string targetPath))
                     {
                         hr = HResult.InternalError;
                     }
                     else
                     {
-                        hr = WritePlaceholderInfo(relativePath, fileInfo, targetPath);
+                        hr = this.WritePlaceholderInfo(relativePath, fileInfo, targetPath);
                     }
                 }
 
@@ -721,14 +722,21 @@ namespace SimpleProviderManaged
             {
                 Log.Information("  {Name}: {Count} calls, {TotalTime}, {AvgTime} ms/call", stat.Key, stat.Value.Count, stat.Value.Duration, stat.Value.Duration.TotalMilliseconds / stat.Value.Count);
             }
+            Log.Information($"FileInfoCache:{this.FileInfoCache.GetStats()}");
+            Log.Information($"DirectoryInfoCache:{this.DirectoryInfoCache.GetStats()}");
+            Log.Information($"DirectoryContentsCache:{this.DirectoryContentsCache.GetStats()}");
         }
 
         #endregion
 
-        private class SimpleCache<KType, VType>
+        public class SimpleCache<KType, VType>
         {
             private readonly ConcurrentDictionary<KType, VType> cache = new ConcurrentDictionary<KType, VType>();
             private readonly Func<KType, VType> valueFactory;
+
+            public long Queries { get; private set; } = 0;
+            public long Misses => this.cache.Count;
+            public long Hits => this.Queries - this.Misses;
 
             public SimpleCache(Func<KType, VType> valueFactory)
             {
@@ -737,8 +745,12 @@ namespace SimpleProviderManaged
 
             public VType Get(KType key)
             {
+                this.Queries++;
                 return this.cache.GetOrAdd(key, this.valueFactory);
             }
+
+            public string GetStats() 
+                => $"Queries: {this.Queries}, Hits: {this.Hits}, Misses: {this.Misses}, Ratio:{(decimal)this.Hits/Math.Max(this.Misses,1)}";
         }
 
         private class RequiredCallbacks : IRequiredCallbacks
