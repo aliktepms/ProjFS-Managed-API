@@ -83,6 +83,7 @@ namespace SimpleProviderManaged
 
             Console.WriteLine("Provider is running.  Press Enter to exit.");
             Console.ReadLine();
+            provider.DumpStats();
         }
     }
 }

@@ -9,6 +9,7 @@ using System.Linq;
 using System.IO;
 using System.Threading;
 using Microsoft.Windows.ProjFS;
+using System.Diagnostics;
 
 namespace SimpleProviderManaged
 {
@@ -18,6 +19,8 @@ namespace SimpleProviderManaged
     /// </summary>
     public class SimpleProvider
     {
+        private ConcurrentDictionary<string, (int Count, TimeSpan Duration)> stats = new ();
+
         // These variables hold the layer and scratch paths.
         private readonly string scratchRoot;
         private readonly string layerRoot;
@@ -335,27 +338,37 @@ namespace SimpleProviderManaged
             uint triggeringProcessId,
             string triggeringProcessImageFileName)
         {
-            Log.Information("----> StartDirectoryEnumerationCallback Path [{Path}]", relativePath);
-
-            // Enumerate the corresponding directory in the layer and ensure it is sorted the way
-            // ProjFS expects.
-            ActiveEnumeration activeEnumeration = new ActiveEnumeration(
-                GetChildItemsInLayer(relativePath)
-                .OrderBy(file => file.Name, new ProjFSSorter())
-                .ToList());
-
-            // Insert the layer enumeration into our dictionary of active enumerations, indexed by
-            // enumeration ID.  GetDirectoryEnumerationCallback will be able to find this enumeration
-            // given the enumeration ID and return the contents to ProjFS.
-            if (!this.activeEnumerations.TryAdd(enumerationId, activeEnumeration))
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
             {
-                return HResult.InternalError;
+                Log.Information("----> StartDirectoryEnumerationCallback Path [{Path}]", relativePath);
+
+                // Enumerate the corresponding directory in the layer and ensure it is sorted the way
+                // ProjFS expects.
+                ActiveEnumeration activeEnumeration = new ActiveEnumeration(
+                    GetChildItemsInLayer(relativePath)
+                    .OrderBy(file => file.Name, new ProjFSSorter())
+                    .ToList());
+
+                // Insert the layer enumeration into our dictionary of active enumerations, indexed by
+                // enumeration ID.  GetDirectoryEnumerationCallback will be able to find this enumeration
+                // given the enumeration ID and return the contents to ProjFS.
+                if (!this.activeEnumerations.TryAdd(enumerationId, activeEnumeration))
+                {
+                    return HResult.InternalError;
+                }
+
+                Log.Information("<---- StartDirectoryEnumerationCallback {Result}", HResult.Ok);
+
+                return HResult.Ok;
             }
-
-            Log.Information("<---- StartDirectoryEnumerationCallback {Result}", HResult.Ok);
-
-            return HResult.Ok;
+            finally
+            {
+                this.UpdateStats(nameof(StartDirectoryEnumerationCallback), stopWatch);
+            }
         }
+
+        private void UpdateStats(string key, Stopwatch stopwatch) => this.stats.AddOrUpdate(key, (1, stopwatch.Elapsed), (k, v) => (v.Item1 + 1, v.Item2 + stopwatch.Elapsed));
 
         internal HResult GetDirectoryEnumerationCallback(
             int commandId,
@@ -364,79 +377,83 @@ namespace SimpleProviderManaged
             bool restartScan,
             IDirectoryEnumerationResults enumResult)
         {
-            Log.Information("----> GetDirectoryEnumerationCallback filterFileName [{Filter}]", filterFileName);
-
-            // Find the requested enumeration.  It should have been put there by StartDirectoryEnumeration.
-            if (!this.activeEnumerations.TryGetValue(enumerationId, out ActiveEnumeration enumeration))
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
             {
-                Log.Fatal("      GetDirectoryEnumerationCallback {Result}", HResult.InternalError);
-                return HResult.InternalError;
-            }
+                Log.Information("----> GetDirectoryEnumerationCallback filterFileName [{Filter}]", filterFileName);
 
-            if (restartScan)
-            {
-                // The caller is restarting the enumeration, so we reset our ActiveEnumeration to the
-                // first item that matches filterFileName.  This also saves the value of filterFileName
-                // into the ActiveEnumeration, overwriting its previous value.
-                enumeration.RestartEnumeration(filterFileName);
-            }
-            else
-            {
-                // The caller is continuing a previous enumeration, or this is the first enumeration
-                // so our ActiveEnumeration is already at the beginning.  TrySaveFilterString()
-                // will save filterFileName if it hasn't already been saved (only if the enumeration
-                // is restarting do we need to re-save filterFileName).
-                enumeration.TrySaveFilterString(filterFileName);
-            }
-
-            int numEntriesAdded = 0;
-            HResult hr = HResult.Ok;
-
-            while (enumeration.IsCurrentValid)
-            {
-                ProjectedFileInfo fileInfo = enumeration.Current;
-
-                if (!TryGetTargetIfReparsePoint(fileInfo, fileInfo.FullName, out string targetPath))
+                // Find the requested enumeration.  It should have been put there by StartDirectoryEnumeration.
+                if (!this.activeEnumerations.TryGetValue(enumerationId, out ActiveEnumeration enumeration))
                 {
-                    hr = HResult.InternalError;
-                    break;
+                    Log.Fatal("      GetDirectoryEnumerationCallback {Result}", HResult.InternalError);
+                    return HResult.InternalError;
                 }
 
-                // A provider adds entries to the enumeration buffer until it runs out, or until adding
-                // an entry fails. If adding an entry fails, the provider remembers the entry it couldn't
-                // add. ProjFS will call the GetDirectoryEnumerationCallback again, and the provider
-                // must resume adding entries, starting at the last one it tried to add. SimpleProvider
-                // remembers the entry it couldn't add simply by not advancing its ActiveEnumeration.
-                if (AddFileInfoToEnum(enumResult, fileInfo, targetPath))
+                if (restartScan)
                 {
-                    Log.Verbose("----> GetDirectoryEnumerationCallback Added {Entry} {Kind} {Target}", fileInfo.Name, fileInfo.IsDirectory, targetPath);
-
-                    ++numEntriesAdded;
-                    enumeration.MoveNext();
+                    // The caller is restarting the enumeration, so we reset our ActiveEnumeration to the
+                    // first item that matches filterFileName.  This also saves the value of filterFileName
+                    // into the ActiveEnumeration, overwriting its previous value.
+                    enumeration.RestartEnumeration(filterFileName);
                 }
                 else
                 {
-                    Log.Verbose("----> GetDirectoryEnumerationCallback NOT added {Entry} {Kind} {Target}", fileInfo.Name, fileInfo.IsDirectory, targetPath);
+                    // The caller is continuing a previous enumeration, or this is the first enumeration
+                    // so our ActiveEnumeration is already at the beginning.  TrySaveFilterString()
+                    // will save filterFileName if it hasn't already been saved (only if the enumeration
+                    // is restarting do we need to re-save filterFileName).
+                    enumeration.TrySaveFilterString(filterFileName);
+                }
 
-                    if (numEntriesAdded == 0)
+                int numEntriesAdded = 0;
+                HResult hr = HResult.Ok;
+
+                while (enumeration.IsCurrentValid)
+                {
+                    ProjectedFileInfo fileInfo = enumeration.Current;
+
+                    if (!TryGetTargetIfReparsePoint(fileInfo, fileInfo.FullName, out string targetPath))
                     {
-                        hr = HResult.InsufficientBuffer;
+                        hr = HResult.InternalError;
+                        break;
                     }
 
-                    break;
+                    // A provider adds entries to the enumeration buffer until it runs out, or until adding
+                    // an entry fails. If adding an entry fails, the provider remembers the entry it couldn't
+                    // add. ProjFS will call the GetDirectoryEnumerationCallback again, and the provider
+                    // must resume adding entries, starting at the last one it tried to add. SimpleProvider
+                    // remembers the entry it couldn't add simply by not advancing its ActiveEnumeration.
+                    if (AddFileInfoToEnum(enumResult, fileInfo, targetPath))
+                    {
+                        Log.Verbose("----> GetDirectoryEnumerationCallback Added {Entry} {Kind} {Target}", fileInfo.Name, fileInfo.IsDirectory, targetPath);
+
+                        ++numEntriesAdded;
+                        enumeration.MoveNext();
+                    }
+                    else
+                    {
+                        Log.Verbose("----> GetDirectoryEnumerationCallback NOT added {Entry} {Kind} {Target}", fileInfo.Name, fileInfo.IsDirectory, targetPath);
+
+                        if (numEntriesAdded == 0)
+                        {
+                            hr = HResult.InsufficientBuffer;
+                        }
+
+                        break;
+                    }
                 }
-            }
 
-            if (hr == HResult.Ok)
-            {
-                Log.Information("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
-            }
-            else
-            {
-                Log.Error("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
-            }
+                if (hr == HResult.Ok)
+                {
+                    Log.Information("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
+                }
+                else
+                {
+                    Log.Error("<---- GetDirectoryEnumerationCallback {Result} [Added entries: {EntryCount}]", hr, numEntriesAdded);
+                }
 
-            return hr;
+                return hr;
+            } finally { this.UpdateStats(nameof(GetDirectoryEnumerationCallback), stopWatch);}
         }
 
         private bool AddFileInfoToEnum(IDirectoryEnumerationResults enumResult, ProjectedFileInfo fileInfo, string targetPath)
@@ -471,16 +488,21 @@ namespace SimpleProviderManaged
         internal HResult EndDirectoryEnumerationCallback(
             Guid enumerationId)
         {
-            Log.Information("----> EndDirectoryEnumerationCallback");
-
-            if (!this.activeEnumerations.TryRemove(enumerationId, out ActiveEnumeration enumeration))
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
             {
-                return HResult.InternalError;
+                Log.Information("----> EndDirectoryEnumerationCallback");
+
+                if (!this.activeEnumerations.TryRemove(enumerationId, out ActiveEnumeration enumeration))
+                {
+                    return HResult.InternalError;
+                }
+
+                Log.Information("<---- EndDirectoryEnumerationCallback {Result}", HResult.Ok);
+
+                return HResult.Ok;
             }
-
-            Log.Information("<---- EndDirectoryEnumerationCallback {Result}", HResult.Ok);
-
-            return HResult.Ok;
+            finally { this.UpdateStats(nameof(EndDirectoryEnumerationCallback), stopWatch); }
         }
 
         internal HResult GetPlaceholderInfoCallback(
@@ -489,30 +511,35 @@ namespace SimpleProviderManaged
             uint triggeringProcessId,
             string triggeringProcessImageFileName)
         {
-            Log.Information("----> GetPlaceholderInfoCallback [{Path}]", relativePath);
-            Log.Information("  Placeholder creation triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
+            {
+                Log.Information("----> GetPlaceholderInfoCallback [{Path}]", relativePath);
+                Log.Information("  Placeholder creation triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
 
-            HResult hr = HResult.Ok;
-            ProjectedFileInfo fileInfo = this.GetFileInfoInLayer(relativePath);
-            if (fileInfo == null)
-            {
-                hr = HResult.FileNotFound;
-            }
-            else
-            {
-                string layerPath = this.GetFullPathInLayer(relativePath);
-                if (!TryGetTargetIfReparsePoint(fileInfo, layerPath, out string targetPath))
+                HResult hr = HResult.Ok;
+                ProjectedFileInfo fileInfo = this.GetFileInfoInLayer(relativePath);
+                if (fileInfo == null)
                 {
-                    hr = HResult.InternalError;
+                    hr = HResult.FileNotFound;
                 }
                 else
                 {
-                    hr = WritePlaceholderInfo(relativePath, fileInfo, targetPath);
+                    string layerPath = this.GetFullPathInLayer(relativePath);
+                    if (!TryGetTargetIfReparsePoint(fileInfo, layerPath, out string targetPath))
+                    {
+                        hr = HResult.InternalError;
+                    }
+                    else
+                    {
+                        hr = WritePlaceholderInfo(relativePath, fileInfo, targetPath);
+                    }
                 }
-            }
 
-            Log.Information("<---- GetPlaceholderInfoCallback {Result}", hr);
-            return hr;
+                Log.Information("<---- GetPlaceholderInfoCallback {Result}", hr);
+                return hr;
+            }
+            finally { this.UpdateStats(nameof(GetPlaceholderInfoCallback), stopWatch); }
         }
 
         private HResult WritePlaceholderInfo(string relativePath, ProjectedFileInfo fileInfo, string targetPath)
@@ -559,7 +586,10 @@ namespace SimpleProviderManaged
             uint triggeringProcessId,
             string triggeringProcessImageFileName)
         {
-            Log.Information("----> GetFileDataCallback relativePath [{Path}]", relativePath);
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
+            {
+                Log.Information("----> GetFileDataCallback relativePath [{Path}]", relativePath);
             Log.Information("  triggered by [{ProcName} {PID}]", triggeringProcessImageFileName, triggeringProcessId);
 
             HResult hr = HResult.Ok;
@@ -631,12 +661,17 @@ namespace SimpleProviderManaged
 
             Log.Information("<---- return status {Result}", hr);
             return hr;
+            }
+            finally { this.UpdateStats(nameof(GetFileDataCallback), stopWatch); }
         }
 
         private HResult QueryFileNameCallback(
             string relativePath)
         {
-            Log.Information("----> QueryFileNameCallback relativePath [{Path}]", relativePath);
+            Stopwatch stopWatch = Stopwatch.StartNew();
+            try
+            {
+                Log.Information("----> QueryFileNameCallback relativePath [{Path}]", relativePath);
 
             HResult hr = HResult.Ok;
             string parentDirectory = Path.GetDirectoryName(relativePath);
@@ -652,6 +687,8 @@ namespace SimpleProviderManaged
 
             Log.Information("<---- QueryFileNameCallback {Result}", hr);
             return hr;
+            }
+            finally { this.UpdateStats(nameof(QueryFileNameCallback), stopWatch); }
         }
 
         private bool TryGetTargetIfReparsePoint(ProjectedFileInfo fileInfo, string fullPath, out string targetPath)
@@ -677,8 +714,32 @@ namespace SimpleProviderManaged
             return true;
         }
 
+        public void DumpStats()
+        {
+            Log.Information("Stats:");
+            foreach (var stat in this.stats)
+            {
+                Log.Information("  {Name}: {Count} calls, {TotalTime}, {AvgTime} ms/call", stat.Key, stat.Value.Count, stat.Value.Duration, stat.Value.Duration.TotalMilliseconds / stat.Value.Count);
+            }
+        }
+
         #endregion
 
+        private class SimpleCache<KType, VType>
+        {
+            private readonly ConcurrentDictionary<KType, VType> cache = new ConcurrentDictionary<KType, VType>();
+            private readonly Func<KType, VType> valueFactory;
+
+            public SimpleCache(Func<KType, VType> valueFactory)
+            {
+                this.valueFactory = valueFactory;
+            }
+
+            public VType Get(KType key)
+            {
+                return this.cache.GetOrAdd(key, this.valueFactory);
+            }
+        }
 
         private class RequiredCallbacks : IRequiredCallbacks
         {
