@@ -749,7 +749,7 @@ namespace SimpleProviderManaged
             }
 
             public string GetStats() 
-                => $"Queries: {this.Queries}, Misses: {this.Misses}, TimeBuilding:{this.factoryTime}, Hits: {this.Hits}, Ratio:{(decimal)this.Hits/Math.Max(this.Misses,1):0.2}";
+                => $"Queries: {this.Queries}, Misses: {this.Misses}, TimeBuilding:{this.factoryTime}, Hits: {this.Hits}, Ratio:{(decimal)this.Hits/(decimal)Math.Max(this.Misses,1),0:F2}";
         }
 
         private class RequiredCallbacks : IRequiredCallbacks
