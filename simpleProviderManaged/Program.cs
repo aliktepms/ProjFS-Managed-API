@@ -4,6 +4,7 @@
 using CommandLine;
 using Serilog;
 using System;
+using System.Runtime.InteropServices;
 
 namespace SimpleProviderManaged
 {
@@ -81,9 +82,27 @@ namespace SimpleProviderManaged
                 Environment.Exit(1);
             }
 
-            Console.WriteLine("Provider is running.  Press Enter to exit.");
-            Console.ReadLine();
-            provider.DumpStats();
+            AppDomain.CurrentDomain.ProcessExit += (object sender, EventArgs e) =>
+            {
+                Log.Information("Process exit");
+                provider.DumpStats();
+                provider.StopVirtualization();
+            };
+
+            Console.WriteLine("Provider is running.  Press <q> to exit, <d> to dump stats.");
+
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+                if (key.KeyChar == 'q')
+                {
+                    break;
+                }
+                else if (key.KeyChar == 'd')
+                {
+                    provider.DumpStats();
+                }
+            }
         }
     }
 }

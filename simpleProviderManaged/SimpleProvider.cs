@@ -137,6 +137,11 @@ namespace SimpleProviderManaged
             return true;
         }
 
+        public void StopVirtualization()
+        {
+            this.virtualizationInstance.StopVirtualizing();
+        }
+
         private static bool IsEnumerationFilterSet(
             string filter)
         {
