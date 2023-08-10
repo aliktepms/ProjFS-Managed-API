@@ -42,6 +42,8 @@ namespace SimpleProviderManaged
             this.Options = options;
 
             this.getLayerFileSystemInfoFuzzyCache = new(this.GetLayerFileSystemInfoFuzzy);
+            this.FileInfoCache = new((relativePath) => new FileInfo(this.GetFullPathInLayer(relativePath)));
+            this.DirectoryInfoCache = new((relativePath) => new DirectoryInfo(this.GetFullPathInLayer(relativePath)));
 
             // If in test mode, enable notification callbacks.
             if (this.Options.TestMode)
@@ -179,15 +181,15 @@ namespace SimpleProviderManaged
 
         protected string GetFullPathInLayer(string relativePath) => Path.Combine(this.layerRoot, relativePath);
 
-        private SimpleCache<string, DirectoryInfo> DirectoryInfoCache = new((p)=>new DirectoryInfo(p));
+        private SimpleCache<string, DirectoryInfo> DirectoryInfoCache;
 
         protected bool DirectoryExistsInLayer(string relativePath)
-            => this.DirectoryInfoCache.Get(this.GetFullPathInLayer(relativePath)).Exists;
+            => this.DirectoryInfoCache.Get(relativePath).Exists;
 
-        private SimpleCache<string,  FileInfo> FileInfoCache = new((p) => new FileInfo(p));
+        private SimpleCache<string,  FileInfo> FileInfoCache;
 
         protected bool FileExistsInLayer(string relativePath)
-            => this.FileInfoCache.Get(this.GetFullPathInLayer(relativePath)).Exists;
+            => this.FileInfoCache.Get(relativePath).Exists;
 
         protected ProjectedFileInfo GetProjectedFileInfoInLayer(string relativePath)
             => this.GetProjectedFileInfo(this.getLayerFileSystemInfoFuzzyCache.Get(relativePath));
@@ -197,8 +199,7 @@ namespace SimpleProviderManaged
         private FileSystemInfo GetLayerFileSystemInfoFuzzy(string relativePath)
         {
             // Check whether the parent directory exists in the layer.
-            string fullPath = this.GetFullPathInLayer(relativePath);
-            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(Path.GetDirectoryName(fullPath));
+            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(Path.GetDirectoryName(relativePath));
 
             // Get the FileSystemInfo for the entry in the layer that matches the name, using ProjFS's
             // name matching rules.
@@ -229,8 +230,7 @@ namespace SimpleProviderManaged
 
         protected IEnumerable<ProjectedFileInfo> GetChildItemsInLayer(string relativePath)
         {
-            string fullPathInLayer = this.GetFullPathInLayer(relativePath);
-            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(fullPathInLayer);
+            DirectoryInfo dirInfo = this.DirectoryInfoCache.Get(relativePath);
 
             if (!dirInfo.Exists)
             {
@@ -244,15 +244,22 @@ namespace SimpleProviderManaged
             }
         }
 
+        private HashSet<string> filesRead = new ();
+
         protected HResult HydrateFile(string relativePath, uint bufferSize, Func<byte[], uint, bool> tryWriteBytes)
         {
-            string layerPath = this.GetFullPathInLayer(relativePath);
-            if (!this.FileInfoCache.Get(layerPath).Exists)
+            lock(this.filesRead)
+            {
+                this.filesRead.Add(relativePath);
+            }
+
+            if (!this.FileInfoCache.Get(relativePath).Exists)
             {
                 return HResult.FileNotFound;
             }
 
             // Open the file in the layer for read.
+            string layerPath = this.GetFullPathInLayer(relativePath);
             using (FileStream fs = new FileStream(layerPath, FileMode.Open, FileAccess.Read))
             {
                 long remainingDataLength = fs.Length;
@@ -695,13 +702,17 @@ namespace SimpleProviderManaged
             Log.Information($"DirectoryInfoCache:{this.DirectoryInfoCache.GetStats()}");
             Log.Information($"DirectoryContentsCache:{this.DirectoryContentsCache.GetStats()}");
             Log.Information($"getLayerFileSystemInfoFuzzyCache:{this.getLayerFileSystemInfoFuzzyCache.GetStats()}");
+
+            // write contents of filesRead to file
+            File.WriteAllLines("FilesRead.log", this.filesRead);
+            File.WriteAllLines("FileInfo.log", this.getLayerFileSystemInfoFuzzyCache.cache.Keys);
         }
 
         #endregion
 
         public class SimpleCache<KType, VType>
         {
-            private readonly ConcurrentDictionary<KType, VType> cache = new ConcurrentDictionary<KType, VType>();
+            public readonly ConcurrentDictionary<KType, VType> cache = new ConcurrentDictionary<KType, VType>();
             private readonly Func<KType, VType> valueFactory;
             private TimeSpan factoryTime = TimeSpan.Zero;
 
