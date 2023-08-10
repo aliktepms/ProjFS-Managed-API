@@ -38,7 +38,7 @@ namespace SimpleProviderManaged
                         // We want verbose logging so we can see all our callback invocations.
                         var logConfig = new LoggerConfiguration()
                            .WriteTo.Console()
-                           .WriteTo.File("SimpleProviderManaged-.log", rollingInterval: RollingInterval.Day);
+                           .WriteTo.File(System.IO.Path.Combine(options.VirtRoot,"Projector.log"));
 
                         if (options.Verbose)
                         {
@@ -86,6 +86,7 @@ namespace SimpleProviderManaged
             {
                 Log.Information("Process exit");
                 provider.DumpStats();
+                provider.DumpCacheMissLogs();
                 provider.StopVirtualization();
             };
 

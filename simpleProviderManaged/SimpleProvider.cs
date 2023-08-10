@@ -707,10 +707,13 @@ namespace SimpleProviderManaged
             Log.Information($"DirectoryInfoCache:{this.DirectoryInfoCache.GetStats()}");
             Log.Information($"DirectoryContentsCache:{this.DirectoryContentsCache.GetStats()}");
             Log.Information($"getLayerFileSystemInfoFuzzyCache:{this.getLayerFileSystemInfoFuzzyCache.GetStats()}");
+        }
 
+        public void DumpCacheMissLogs()
+        {
             // write contents of filesRead to file
-            File.WriteAllLines("FilesRead.log", this.filesRead);
-            File.WriteAllLines("FileInfo.log", this.getLayerFileSystemInfoFuzzyCache.cache.Keys);
+            File.AppendAllLines(Path.Combine(this.scratchRoot, "Projector_FilesRead.log"), this.filesRead);
+            File.AppendAllLines(Path.Combine(this.scratchRoot, "Projector_FileInfo.log"), this.getLayerFileSystemInfoFuzzyCache.cache.Keys);
         }
 
         #endregion
